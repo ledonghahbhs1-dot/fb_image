@@ -45,6 +45,97 @@ function classifyUrl(url: string): "profile" | "post" | "thumbnail" | "other" {
   return "other";
 }
 
+// ─── Relay User extraction ─────────────────────────────────────────────────
+
+interface RelayUser {
+  id: string;
+  url: string | null;
+  profile_url: string | null;
+  short_name: string | null;
+  name: string | null;
+  gender: string | null;
+  work_info: unknown;
+  education_info: unknown;
+  hometown: string | null;
+  current_city: string | null;
+  relationship_status: string | null;
+  follower_count: number | null;
+  friend_count: number | null;
+  profile_picture: string | null;
+  cover_photo: string | null;
+  bio: string | null;
+  verified: boolean | null;
+}
+
+function extractRelayUsers(html: string): RelayUser[] {
+  const users = new Map<string, RelayUser>();
+
+  // Match the specific Relay User pattern Facebook embeds
+  const marker = /"__typename"\s*:\s*"User"\s*,\s*"__isEntity"\s*:\s*"User"\s*,\s*"__isActor"\s*:\s*"User"\s*,\s*"id"\s*:\s*"(\d+)"/g;
+
+  let match: RegExpExecArray | null;
+  while ((match = marker.exec(html)) !== null) {
+    const id = match[1];
+    if (users.has(id)) continue;
+
+    // Grab a generous window of context around the match
+    const winStart = Math.max(0, match.index - 50);
+    const winEnd   = Math.min(html.length, match.index + 3000);
+    const chunk    = html.slice(winStart, winEnd);
+
+    // Helper: extract first regex match from chunk
+    const pick = (re: RegExp) => { const m = chunk.match(re); return m?.[1] ?? null; };
+
+    // Unescape Facebook's \/ encoding
+    const unescape = (s: string | null) => s ? s.replace(/\\\//g, "/").replace(/\\u003C/g, "<").replace(/\\"/g, '"') : null;
+
+    // Parse a nullable JSON field value (object or null)
+    const parseNullable = (key: string): unknown => {
+      const re = new RegExp(`"${key}"\\s*:\\s*(\\{[^{}]{0,800}\\}|null)`);
+      const m = chunk.match(re);
+      if (!m || m[1] === "null") return null;
+      try { return JSON.parse(m[1].replace(/\\\//g, "/")); } catch { return m[1]; }
+    };
+
+    const rawName    = pick(/"name"\s*:\s*"([^"]{1,120})"/);
+    const rawUrl     = pick(/"url"\s*:\s*"([^"]+)"/);
+    const rawPUrl    = pick(/"profile_url"\s*:\s*"([^"]+)"/);
+    const rawShort   = pick(/"short_name"\s*:\s*"([^"]{1,80})"/);
+    const rawGender  = pick(/"gender"\s*:\s*"([^"]+)"/);
+    const rawHt      = pick(/"hometown"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/s);
+    const rawCity    = pick(/"current_city"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/s);
+    const rawRel     = pick(/"relationship_status"\s*:\s*"([^"]+)"/);
+    const rawFoll    = pick(/"follower_count"\s*:\s*(\d+)/);
+    const rawFriend  = pick(/"friend_count"\s*:\s*(\d+)/);
+    const rawPic     = pick(/"profile_picture_uri"\s*:\s*"([^"]+)"/);
+    const rawCover   = pick(/"cover_photo"\s*:\s*\{[^}]*"photo"\s*:\s*\{[^}]*"image"\s*:\s*\{[^}]*"uri"\s*:\s*"([^"]+)"/s);
+    const rawBio     = pick(/"biography"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]+)"/s);
+    const rawVerif   = pick(/"is_verified"\s*:\s*(true|false)/);
+
+    users.set(id, {
+      id,
+      url:                 unescape(rawUrl),
+      profile_url:         unescape(rawPUrl),
+      short_name:          rawShort,
+      name:                rawName,
+      gender:              rawGender,
+      work_info:           parseNullable("work_info"),
+      education_info:      parseNullable("education_info"),
+      hometown:            rawHt,
+      current_city:        rawCity,
+      relationship_status: rawRel,
+      follower_count:      rawFoll ? Number(rawFoll) : null,
+      friend_count:        rawFriend ? Number(rawFriend) : null,
+      profile_picture:     unescape(rawPic),
+      cover_photo:         unescape(rawCover),
+      bio:                 rawBio,
+      verified:            rawVerif ? rawVerif === "true" : null,
+    });
+  }
+
+  return [...users.values()];
+}
+
 // ─── Deep extraction helpers ───────────────────────────────────────────────
 
 function first(html: string, ...patterns: RegExp[]): string | null {
@@ -201,6 +292,9 @@ function deepParse(html: string, pageUrl?: string) {
     }
   }
 
+  // ── Relay Users (structured Relay JSON objects) ──
+  const relayUsers = extractRelayUsers(html);
+
   // ── Images ──
   const imageUrls = extractFbcdnUrls(html);
   const images = imageUrls.map(u => ({ url: u, type: classifyUrl(u) }));
@@ -272,6 +366,8 @@ function deepParse(html: string, pageUrl?: string) {
     },
     // ── Raw JSON snippets found in page
     json_snippets: jsonBlobs.slice(0, 10),
+    // ── Relay User objects (structured __typename:User blocks)
+    relay_users: relayUsers,
   };
 }
 
@@ -316,6 +412,31 @@ router.post("/facebook/deep/html", async (req: Request, res: Response) => {
     return;
   }
   res.json(deepParse(html, url));
+});
+
+// NEW: extract relay users only (fast, no image processing)
+router.get("/facebook/relay-users", async (req: Request, res: Response) => {
+  const { url } = req.query as { url?: string };
+  if (!url) { res.status(400).json({ error: "Missing ?url=", example: "/api/facebook/relay-users?url=https://www.facebook.com/username" }); return; }
+  if (!url.includes("facebook.com")) { res.status(400).json({ error: "URL must be facebook.com" }); return; }
+  try {
+    const response = await fetch(url, { headers: BROWSER_HEADERS, redirect: "follow" });
+    if (!response.ok) { res.status(502).json({ error: `Facebook HTTP ${response.status}`, hint: "Page may require login" }); return; }
+    const html = await response.text();
+    const users = extractRelayUsers(html);
+    res.json({ page_url: url, total: users.length, users });
+  } catch (err) { res.status(500).json({ error: (err as Error).message }); }
+});
+
+// NEW: extract relay users from pasted HTML
+router.post("/facebook/relay-users/html", async (req: Request, res: Response) => {
+  const { html, url } = req.body as { html?: string; url?: string };
+  if (!html || typeof html !== "string") {
+    res.status(400).json({ error: "Missing 'html' in body", usage: "POST body: { \"html\": \"<view-source paste>\", \"url\": \"optional\" }" });
+    return;
+  }
+  const users = extractRelayUsers(html);
+  res.json({ page_url: url ?? null, total: users.length, users });
 });
 
 // Existing: scrape images from pasted HTML

@@ -47,6 +47,10 @@ function classifyUrl(url: string): "profile" | "post" | "thumbnail" | "other" {
 
 // ─── Relay User extraction ─────────────────────────────────────────────────
 
+interface WorkEntry    { employer: string; position: string | null; start_year: number | null; end_year: number | null; }
+interface EduEntry     { school: string; type: string | null; year: string | null; }
+interface BirthdayInfo { day: number | null; month: number | null; year: number | null; text: string | null; }
+
 interface RelayUser {
   id: string;
   url: string | null;
@@ -54,17 +58,93 @@ interface RelayUser {
   short_name: string | null;
   name: string | null;
   gender: string | null;
-  work_info: unknown;
-  education_info: unknown;
+  birthday: BirthdayInfo | null;
   hometown: string | null;
   current_city: string | null;
   relationship_status: string | null;
+  work: WorkEntry[];
+  education: EduEntry[];
+  phones: string[];
+  emails: string[];
   follower_count: number | null;
   friend_count: number | null;
   profile_picture: string | null;
   cover_photo: string | null;
   bio: string | null;
   verified: boolean | null;
+}
+
+// ─── helpers shared between relay & deepParse ──────────────────────────────
+
+function fbUnescape(s: string): string {
+  return s.replace(/\\\//g, "/").replace(/\\u003C/g, "<").replace(/\\u003E/g, ">").replace(/\\u0026/g, "&").replace(/\\"/g, '"');
+}
+
+/** Extract birthday from all known FB formats found anywhere in a text chunk */
+function parseBirthday(chunk: string): BirthdayInfo | null {
+  // Format 1: {"day":D,"month":M,"year":Y}  (any key order)
+  const obj = chunk.match(/"birthdate"\s*:\s*\{([^}]{0,200})\}/s)
+           ?? chunk.match(/"birthday"\s*:\s*\{([^}]{0,200})\}/s);
+  if (obj) {
+    const inner = obj[1];
+    const day   = inner.match(/"day"\s*:\s*(\d+)/)?.[1] ?? null;
+    const month = inner.match(/"month"\s*:\s*(\d+)/)?.[1] ?? null;
+    const year  = inner.match(/"year"\s*:\s*(\d+)/)?.[1] ?? null;
+    const text  = inner.match(/"text"\s*:\s*"([^"]+)"/)?.[1] ?? null;
+    if (day || month || year || text) {
+      return { day: day ? +day : null, month: month ? +month : null, year: year ? +year : null, text };
+    }
+  }
+  // Format 2: "birth_date":"MM/DD/YYYY"
+  const bd2 = chunk.match(/"birth_date"\s*:\s*"(\d{1,2}\/\d{1,2}\/\d{4})"/);
+  if (bd2) {
+    const [m, d, y] = bd2[1].split("/").map(Number);
+    return { day: d ?? null, month: m ?? null, year: y ?? null, text: bd2[1] };
+  }
+  // Format 3: "birthday_reminder_info":{..."date":"Jan 1"}
+  const bd3 = chunk.match(/"birthday_reminder_info"\s*:\s*\{[^}]{0,400}"date"\s*:\s*"([^"]+)"/s);
+  if (bd3) return { day: null, month: null, year: null, text: bd3[1] };
+  // Format 4: birth_day / birth_month / birth_year as separate keys
+  const d4 = chunk.match(/"birth_day"\s*:\s*(\d+)/)?.[1];
+  const m4 = chunk.match(/"birth_month"\s*:\s*(\d+)/)?.[1];
+  const y4 = chunk.match(/"birth_year"\s*:\s*(\d+)/)?.[1];
+  if (d4 || m4 || y4) return { day: d4 ? +d4 : null, month: m4 ? +m4 : null, year: y4 ? +y4 : null, text: null };
+  return null;
+}
+
+/** Extract structured work history from a text chunk */
+function parseWork(chunk: string): WorkEntry[] {
+  const entries: WorkEntry[] = [];
+  // Pattern: "employer":{"name":"X"}...optional "position":{"name":"Y"}
+  const re = /"employer"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"[^}]*\}/gs;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(chunk)) !== null) {
+    const employerName = m[1];
+    // look for position nearby (within 400 chars after employer block)
+    const nearby = chunk.slice(m.index, Math.min(chunk.length, m.index + 600));
+    const pos    = nearby.match(/"position"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/s)?.[1] ?? null;
+    const sy     = nearby.match(/"start_year"\s*:\s*(\d{4})/)?.[1] ?? nearby.match(/"start_date"\s*:\s*"(\d{4})"/)?.[1] ?? null;
+    const ey     = nearby.match(/"end_year"\s*:\s*(\d{4})/)?.[1]   ?? nearby.match(/"end_date"\s*:\s*"(\d{4})"/)?.[1]   ?? null;
+    entries.push({ employer: employerName, position: pos, start_year: sy ? +sy : null, end_year: ey ? +ey : null });
+  }
+  return entries;
+}
+
+/** Extract structured education history from a text chunk */
+function parseEducation(chunk: string): EduEntry[] {
+  const entries: EduEntry[] = [];
+  const re = /"school"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"[^}]*\}/gs;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(chunk)) !== null) {
+    const schoolName = m[1];
+    const nearby = chunk.slice(m.index, Math.min(chunk.length, m.index + 600));
+    const type = nearby.match(/"type"\s*:\s*"([^"]+)"/)?.[1] ?? null;
+    const year = nearby.match(/"year"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/s)?.[1]
+              ?? nearby.match(/"graduation_year"\s*:\s*(\d{4})/)?.[1]
+              ?? null;
+    entries.push({ school: schoolName, type, year });
+  }
+  return entries;
 }
 
 function extractRelayUsers(html: string): RelayUser[] {
@@ -78,56 +158,69 @@ function extractRelayUsers(html: string): RelayUser[] {
     const id = match[1];
     if (users.has(id)) continue;
 
-    // Grab a generous window of context around the match
-    const winStart = Math.max(0, match.index - 50);
-    const winEnd   = Math.min(html.length, match.index + 3000);
+    // Large window: 200 chars before (for context), 10000 after (to capture all nested profile fields)
+    const winStart = Math.max(0, match.index - 200);
+    const winEnd   = Math.min(html.length, match.index + 10000);
     const chunk    = html.slice(winStart, winEnd);
 
-    // Helper: extract first regex match from chunk
-    const pick = (re: RegExp) => { const m = chunk.match(re); return m?.[1] ?? null; };
+    const pick = (re: RegExp) => { const m = chunk.match(re); return m?.[1] ? fbUnescape(m[1]) : null; };
 
-    // Unescape Facebook's \/ encoding
-    const unescape = (s: string | null) => s ? s.replace(/\\\//g, "/").replace(/\\u003C/g, "<").replace(/\\"/g, '"') : null;
+    const rawUrl   = pick(/"url"\s*:\s*"([^"]+)"/);
+    const rawPUrl  = pick(/"profile_url"\s*:\s*"([^"]+)"/);
+    const rawShort = pick(/"short_name"\s*:\s*"([^"]{1,80})"/);
+    const rawName  = pick(/"(?:name|full_name)"\s*:\s*"([A-Za-zÀ-ÿ\u00C0-\u024F0-9 .''`-]{1,120})"/);
+    const rawGend  = pick(/"gender"\s*:\s*"([^"]+)"/);
+    const rawRel   = pick(/"relationship_status"\s*:\s*"([^"]+)"/);
+    const rawFoll  = pick(/"follower_count"\s*:\s*(\d+)/);
+    const rawFriendCount = pick(/"friend_count"\s*:\s*(\d+)/);
+    const rawVerif = pick(/"is_verified"\s*:\s*(true|false)/);
+    const rawBio   = pick(/"(?:biography|about)"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]{1,500})"/s);
 
-    // Parse a nullable JSON field value (object or null)
-    const parseNullable = (key: string): unknown => {
-      const re = new RegExp(`"${key}"\\s*:\\s*(\\{[^{}]{0,800}\\}|null)`);
-      const m = chunk.match(re);
-      if (!m || m[1] === "null") return null;
-      try { return JSON.parse(m[1].replace(/\\\//g, "/")); } catch { return m[1]; }
-    };
+    // Location – city name (handles nested: "hometown":{"name":"..."} and deeper nesting)
+    const rawHt   = pick(/"hometown"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s)
+                 ?? pick(/"hometown_city"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s);
+    const rawCity = pick(/"current_city"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s)
+                 ?? pick(/"current_location"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s);
 
-    const rawName    = pick(/"name"\s*:\s*"([^"]{1,120})"/);
-    const rawUrl     = pick(/"url"\s*:\s*"([^"]+)"/);
-    const rawPUrl    = pick(/"profile_url"\s*:\s*"([^"]+)"/);
-    const rawShort   = pick(/"short_name"\s*:\s*"([^"]{1,80})"/);
-    const rawGender  = pick(/"gender"\s*:\s*"([^"]+)"/);
-    const rawHt      = pick(/"hometown"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/s);
-    const rawCity    = pick(/"current_city"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/s);
-    const rawRel     = pick(/"relationship_status"\s*:\s*"([^"]+)"/);
-    const rawFoll    = pick(/"follower_count"\s*:\s*(\d+)/);
-    const rawFriend  = pick(/"friend_count"\s*:\s*(\d+)/);
-    const rawPic     = pick(/"profile_picture_uri"\s*:\s*"([^"]+)"/);
-    const rawCover   = pick(/"cover_photo"\s*:\s*\{[^}]*"photo"\s*:\s*\{[^}]*"image"\s*:\s*\{[^}]*"uri"\s*:\s*"([^"]+)"/s);
-    const rawBio     = pick(/"biography"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]+)"/s);
-    const rawVerif   = pick(/"is_verified"\s*:\s*(true|false)/);
+    // Profile picture – prefer high-res uri
+    const rawPic  = pick(/"profile_picture_uri"\s*:\s*"([^"]+)"/)
+                 ?? pick(/"profile_picture"\s*:\s*\{[^}]{0,200}"uri"\s*:\s*"([^"]+)"/s);
+
+    // Cover photo uri
+    const rawCover = pick(/"cover_photo"\s*:\s*\{[^}]{0,600}"uri"\s*:\s*"([^"]+)"/s);
+
+    // Contact info (if publicly embedded)
+    const rawPhones = [...chunk.matchAll(/"(?:phone|mobile|phone_number)"\s*:\s*"(\+?[\d\s\-().]{7,20})"/g)]
+      .map(m => m[1]).filter(p => p.replace(/\D/g, "").length >= 7);
+    const rawEmails = [...chunk.matchAll(/"(?:email|contact_email)"\s*:\s*"([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})"/g)]
+      .map(m => m[1]).filter(e => !e.includes("facebook.com") && !e.includes("sentry.io"));
+
+    // Birthday
+    const birthday = parseBirthday(chunk);
+
+    // Work & Education (structured)
+    const work      = parseWork(chunk);
+    const education = parseEducation(chunk);
 
     users.set(id, {
       id,
-      url:                 unescape(rawUrl),
-      profile_url:         unescape(rawPUrl),
+      url:                 rawUrl,
+      profile_url:         rawPUrl,
       short_name:          rawShort,
       name:                rawName,
-      gender:              rawGender,
-      work_info:           parseNullable("work_info"),
-      education_info:      parseNullable("education_info"),
+      gender:              rawGend,
+      birthday,
       hometown:            rawHt,
       current_city:        rawCity,
       relationship_status: rawRel,
+      work,
+      education,
+      phones:              [...new Set(rawPhones)],
+      emails:              [...new Set(rawEmails)],
       follower_count:      rawFoll ? Number(rawFoll) : null,
-      friend_count:        rawFriend ? Number(rawFriend) : null,
-      profile_picture:     unescape(rawPic),
-      cover_photo:         unescape(rawCover),
+      friend_count:        rawFriendCount ? Number(rawFriendCount) : null,
+      profile_picture:     rawPic,
+      cover_photo:         rawCover,
       bio:                 rawBio,
       verified:            rawVerif ? rawVerif === "true" : null,
     });
@@ -195,11 +288,7 @@ function deepParse(html: string, pageUrl?: string) {
     /gender['"]\s*:\s*['"]([^'"]+)['"]/i,
   );
 
-  const birthday = first(html,
-    /"birthday_reminder_info"[^}]*"date"\s*:\s*"([^"]+)"/s,
-    /"birth_date"\s*:\s*"([^"]+)"/,
-    /"birthdate"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]+)"/s,
-  );
+  const birthdayInfo = parseBirthday(html);
 
   const createdTime = first(html,
     /"creation_time"\s*:\s*(\d+)/,
@@ -214,18 +303,18 @@ function deepParse(html: string, pageUrl?: string) {
 
   // ── Location ──
   const hometown = first(html,
-    /"hometown"\s*:\{[^}]*"name"\s*:\s*"([^"]+)"/s,
-    /"hometown_city"\s*:\{[^}]*"name"\s*:\s*"([^"]+)"/s,
+    /"hometown"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s,
+    /"hometown_city"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s,
   );
   const currentCity = first(html,
-    /"current_city"\s*:\{[^}]*"name"\s*:\s*"([^"]+)"/s,
-    /"current_address"\s*:\{[^}]*"city"\s*:\s*"([^"]+)"/s,
+    /"current_city"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s,
+    /"current_location"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s,
+    /"current_address"\s*:\s*\{[^}]{0,300}"city"\s*:\s*"([^"]+)"/s,
   );
 
-  // ── Work & Education ──
-  const workMatches   = all(html, /"employer"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/gs);
-  const schoolMatches = all(html, /"school"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/gs);
-  const positionMatches = all(html, /"position"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/gs);
+  // ── Work & Education (structured) ──
+  const workEntries = parseWork(html);
+  const eduEntries  = parseEducation(html);
 
   // ── Stats ──
   const followerCount = first(html,
@@ -314,7 +403,7 @@ function deepParse(html: string, pageUrl?: string) {
     // ── Profile
     profile: {
       gender:              gender ?? null,
-      birthday:            birthday ?? null,
+      birthday:            birthdayInfo,
       account_created_at:  createdTime ? new Date(Number(createdTime) * 1000).toISOString() : null,
       account_created_ts:  createdTime ? Number(createdTime) : null,
       relationship_status: relationshipStatus ?? null,
@@ -326,9 +415,8 @@ function deepParse(html: string, pageUrl?: string) {
     },
     // ── Work & Education
     work_education: {
-      employers: workMatches,
-      positions: positionMatches,
-      schools:   schoolMatches,
+      work:      workEntries,
+      education: eduEntries,
     },
     // ── IDs
     ids: {

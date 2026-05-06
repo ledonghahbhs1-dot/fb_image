@@ -238,21 +238,52 @@ function extractRelayUsers(html: string): RelayUser[] {
   return [...users.values()];
 }
 
-// ─── item_subtitle extraction ──────────────────────────────────────────────
+// ─── item_title & item_subtitle extraction ─────────────────────────────────
+
+/** Extract all item_title text values from Facebook HTML (school, work, location labels) */
+function extractItemTitles(html: string): string[] {
+  const results: string[] = [];
+  const seen = new Set<string>();
+  const re = /"item_title"\s*:\s*\{"text"\s*:\s*\{"text"\s*:\s*"([^"]{1,300})"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const text = fbUnescape(m[1]);
+    if (text && !seen.has(text)) { seen.add(text); results.push(text); }
+  }
+  return results;
+}
 
 /** Extract all item_subtitle text values from Facebook HTML (e.g. "Sống ở Hà Nội", "Độc thân") */
 function extractItemSubtitles(html: string): string[] {
   const results: string[] = [];
   const seen = new Set<string>();
-  // Pattern: "item_subtitle":{"text":{"text":"<value>"
   const re = /"item_subtitle"\s*:\s*\{"text"\s*:\s*\{"text"\s*:\s*"([^"]{1,300})"/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(html)) !== null) {
     const text = fbUnescape(m[1]);
-    if (text && !seen.has(text)) {
-      seen.add(text);
-      results.push(text);
-    }
+    if (text && !seen.has(text)) { seen.add(text); results.push(text); }
+  }
+  return results;
+}
+
+/** Extract User identity blocks: {id, name, short_name, profile_url} from __typename:User blocks */
+function extractUserProfiles(html: string): Array<{ id: string; name: string | null; short_name: string | null; profile_url: string | null }> {
+  const results: Array<{ id: string; name: string | null; short_name: string | null; profile_url: string | null }> = [];
+  const seen = new Set<string>();
+  const re = /"__typename"\s*:\s*"User"\s*,\s*"id"\s*:\s*"(\d+)"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const id = m[1];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const chunk = html.slice(Math.max(0, m.index - 100), Math.min(html.length, m.index + 2000));
+    const pick = (re: RegExp) => { const r = chunk.match(re); return r?.[1] ? fbUnescape(r[1]) : null; };
+    results.push({
+      id,
+      name:        pick(/"(?:name|full_name)"\s*:\s*"([^"]{1,120})"/),
+      short_name:  pick(/"short_name"\s*:\s*"([^"]{1,80})"/),
+      profile_url: pick(/"(?:profile_url|url)"\s*:\s*"(https:\/\/(?:www\.)?facebook\.com\/[^"]+)"/),
+    });
   }
   return results;
 }
@@ -554,8 +585,12 @@ function deepParse(html: string, pageUrl?: string) {
     }
   }
 
-  // ── item_subtitle texts (e.g. "Sống ở Hà Nội", "Độc thân") ──
+  // ── item_title & item_subtitle texts ──
+  const itemTitles    = extractItemTitles(html);
   const itemSubtitles = extractItemSubtitles(html);
+
+  // ── User identity blocks (id, name, short_name, profile_url) ──
+  const userProfiles = extractUserProfiles(html);
 
   // ── Relay Users (structured Relay JSON objects) ──
   const relayUsers = extractRelayUsers(html);
@@ -593,6 +628,8 @@ function deepParse(html: string, pageUrl?: string) {
       profile_picture:     profilePicFromSection || ogImage || null,
       // Human-readable display texts Facebook shows on the About tab
       display_info:        tileTexts.filter(t => t.length > 2 && !/^[\d.]+$/.test(t)).slice(0, 20),
+      // item_title texts (school name, employer, location label...)
+      item_titles:         itemTitles,
       // item_subtitle texts (e.g. "Sống ở Hà Nội", "Độc thân", "Học tại ...")
       item_subtitles:      itemSubtitles,
     },
@@ -656,6 +693,8 @@ function deepParse(html: string, pageUrl?: string) {
     json_snippets: jsonBlobs.slice(0, 10),
     // ── Relay User objects (structured __typename:User blocks)
     relay_users: relayUsers,
+    // ── User identity blocks (id, name, short_name, profile_url) từ __typename:User
+    user_profiles: userProfiles,
   };
 }
 

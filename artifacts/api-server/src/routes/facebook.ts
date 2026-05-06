@@ -417,6 +417,70 @@ function deepParse(html: string, pageUrl?: string) {
     /"mutual_friends_count"\s*:\s*(\d+)/,
   );
 
+  // ── Social context (profile_social_context) ──
+  // Contains human-readable texts like "181 người bạn" and "1 bạn chung"
+  // plus facepile_profiles (mutual friends shown on profile card)
+  const socialCtxM = html.match(/"profile_social_context"\s*:\s*\{([\s\S]{0,3000})/s);
+  const socialCtxChunk = socialCtxM ? socialCtxM[1] : "";
+
+  // Extract text items (e.g. "181 người bạn", "1 bạn chung")
+  const socialContextTexts: Array<{ text: string; url: string | null }> = [];
+  const scItemRe = /"text"\s*:\s*\{[^}]{0,500}"text"\s*:\s*"([^"]{2,200})"[^}]{0,200}\}[^}]{0,200}"uri"\s*:\s*"([^"]*)"/gs;
+  for (const scm of socialCtxChunk.matchAll(scItemRe)) {
+    socialContextTexts.push({ text: fbUnescape(scm[1]), url: fbUnescape(scm[2]) || null });
+  }
+  // Simpler fallback: just grab all text values from social context
+  if (socialContextTexts.length === 0 && socialCtxChunk) {
+    for (const tm of socialCtxChunk.matchAll(/"text"\s*:\s*"([^"]{3,200})"/g)) {
+      const t = fbUnescape(tm[1]);
+      if (/\d/.test(t) && !socialContextTexts.find(x => x.text === t)) {
+        socialContextTexts.push({ text: t, url: null });
+      }
+    }
+  }
+
+  // Parse friend count and mutual friends count from social context texts
+  const friendCountFromText = (() => {
+    for (const item of socialContextTexts) {
+      const m = item.text.match(/^([\d,.]+)\s+(?:người bạn|friends?)\b/i);
+      if (m) return m[1].replace(/[,.]/g, "");
+    }
+    return null;
+  })();
+  const mutualFriendCountFromText = (() => {
+    for (const item of socialContextTexts) {
+      const m = item.text.match(/^([\d,.]+)\s+(?:bạn chung|mutual friends?)\b/i);
+      if (m) return m[1].replace(/[,.]/g, "");
+    }
+    return null;
+  })();
+
+  // Facepile profiles (mutual friends shown on profile card)
+  const facepileM = socialCtxChunk.match(/"facepile_profiles"\s*:\s*\[([\s\S]{0,5000})\]/s);
+  const facepileProfiles: Array<{ name: string; pic: string | null }> = [];
+  if (facepileM) {
+    for (const fp of facepileM[1].matchAll(/"name"\s*:\s*"([^"]{2,100})"\s*,\s*"profile_picture"\s*:\s*\{\s*"uri"\s*:\s*"([^"]+)"/g)) {
+      facepileProfiles.push({ name: fbUnescape(fp[1]), pic: fbUnescape(fp[2]) });
+    }
+  }
+
+  // ── Tab URLs (followers / following / likes) ──
+  // Look for "tab_key":"X","tracking":"X","url":"..." pattern (url is the tab's own URL)
+  const tabUrlFor = (tabKey: string): string | null => {
+    // Pattern: tab_key + optional fields + url, stopping before next tab_key
+    const re = new RegExp(`"tab_key"\\s*:\\s*"${tabKey}"[^}]{0,400}?"url"\\s*:\\s*"(https://[^"]+)"`, "s");
+    const m = html.match(re);
+    if (m) return fbUnescape(m[1]);
+    // Fallback: construct from page_url
+    const base = (profileUrlFromSection || ogUrl || pageUrl || "").replace(/\/$/, "");
+    if (!base.includes("facebook.com")) return null;
+    return `${base}/${tabKey}`;
+  };
+  const followersTabUrl = tabUrlFor("followers");
+  const followingTabUrl = tabUrlFor("following");
+  const likesTabUrl     = tabUrlFor("likes");
+  const friendsTabUrl   = tabUrlFor("friends");
+
   // ── Page / Group IDs ──
   const pageGroupIds = all(html, /"(?:page_id|group_id|pageID)"\s*:\s*"(\d+)"/g);
 
@@ -501,11 +565,28 @@ function deepParse(html: string, pageUrl?: string) {
       hometown:            hometown ?? null,
       current_city:        currentCity ?? null,
       follower_count:      followerCount ? Number(followerCount) : null,
-      friend_count:        friendCount   ? Number(friendCount)   : null,
+      friend_count:        friendCount ? Number(friendCount) : (friendCountFromText ? Number(friendCountFromText) : null),
+      mutual_friend_count: mutualFriendCountFromText ? Number(mutualFriendCountFromText) : null,
       bio:                 ogDesc ?? metaDesc ?? null,
       profile_picture:     profilePicFromSection || ogImage || null,
       // Human-readable display texts Facebook shows on the About tab
       display_info:        tileTexts.filter(t => t.length > 2 && !/^[\d.]+$/.test(t)).slice(0, 20),
+    },
+    // ── Social (friends, followers, following, likes tabs) ──
+    social: {
+      // Human-readable social counts (e.g. "181 người bạn", "1 bạn chung")
+      // NOTE: Facebook does NOT embed follower/following counts as numbers in profile HTML.
+      // These are loaded dynamically per-tab. Scrape the tab URLs below to get lists.
+      social_context:       socialContextTexts,
+      // Mutual friends shown on the profile card (name + profile picture)
+      mutual_friends_shown: facepileProfiles,
+      // Tab URLs — fetch these to get full follower/following/likes lists
+      tab_urls: {
+        followers: followersTabUrl,
+        following: followingTabUrl,
+        likes:     likesTabUrl,
+        friends:   friendsTabUrl,
+      },
     },
     // ── Work & Education
     work_education: {

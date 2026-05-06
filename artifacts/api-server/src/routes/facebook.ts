@@ -238,6 +238,25 @@ function extractRelayUsers(html: string): RelayUser[] {
   return [...users.values()];
 }
 
+// ─── item_subtitle extraction ──────────────────────────────────────────────
+
+/** Extract all item_subtitle text values from Facebook HTML (e.g. "Sống ở Hà Nội", "Độc thân") */
+function extractItemSubtitles(html: string): string[] {
+  const results: string[] = [];
+  const seen = new Set<string>();
+  // Pattern: "item_subtitle":{"text":{"text":"<value>"
+  const re = /"item_subtitle"\s*:\s*\{"text"\s*:\s*\{"text"\s*:\s*"([^"]{1,300})"/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const text = fbUnescape(m[1]);
+    if (text && !seen.has(text)) {
+      seen.add(text);
+      results.push(text);
+    }
+  }
+  return results;
+}
+
 // ─── Deep extraction helpers ───────────────────────────────────────────────
 
 function first(html: string, ...patterns: RegExp[]): string | null {
@@ -535,6 +554,9 @@ function deepParse(html: string, pageUrl?: string) {
     }
   }
 
+  // ── item_subtitle texts (e.g. "Sống ở Hà Nội", "Độc thân") ──
+  const itemSubtitles = extractItemSubtitles(html);
+
   // ── Relay Users (structured Relay JSON objects) ──
   const relayUsers = extractRelayUsers(html);
 
@@ -571,6 +593,8 @@ function deepParse(html: string, pageUrl?: string) {
       profile_picture:     profilePicFromSection || ogImage || null,
       // Human-readable display texts Facebook shows on the About tab
       display_info:        tileTexts.filter(t => t.length > 2 && !/^[\d.]+$/.test(t)).slice(0, 20),
+      // item_subtitle texts (e.g. "Sống ở Hà Nội", "Độc thân", "Học tại ...")
+      item_subtitles:      itemSubtitles,
     },
     // ── Social (friends, followers, following, likes tabs) ──
     social: {

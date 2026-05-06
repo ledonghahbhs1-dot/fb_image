@@ -17,144 +17,317 @@ const BROWSER_HEADERS = {
   "Upgrade-Insecure-Requests": "1",
 };
 
+// ─── Image extraction ──────────────────────────────────────────────────────
+
 function extractFbcdnUrls(html: string): string[] {
   const seen = new Set<string>();
   const results: string[] = [];
-
-  // Pattern to match Facebook CDN image URLs
   const patterns = [
-    // xlink:href="..." and href="..."
     /(?:xlink:href|href)="(https:\/\/scontent[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi,
-    // src="..."
     /src="(https:\/\/scontent[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi,
-    // JSON-escaped URLs: "https:\/\/scontent..."
     /"(https:\\\/\\\/scontent[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"/gi,
-    // Plain URLs in JS/JSON blocks
     /(https:\/\/scontent[\w.\-/]+\.(?:jpg|jpeg|png|webp)(?:\?[^"'\s<>]*)?)/gi,
   ];
-
   for (const pattern of patterns) {
     let match;
     while ((match = pattern.exec(html)) !== null) {
-      let url = match[1];
-      // Unescape JSON-escaped forward slashes
-      url = url.replace(/\\\//g, "/");
-      // Decode HTML entities
-      url = url.replace(/&amp;/g, "&");
-      // Only keep if not already seen
-      if (!seen.has(url)) {
-        seen.add(url);
-        results.push(url);
-      }
+      let url = match[1].replace(/\\\//g, "/").replace(/&amp;/g, "&");
+      if (!seen.has(url)) { seen.add(url); results.push(url); }
     }
   }
-
   return results;
 }
 
 function classifyUrl(url: string): "profile" | "post" | "thumbnail" | "other" {
   if (url.includes("_s40x40") || url.includes("_s50x50") || url.includes("_s32x32")) return "thumbnail";
-  if (url.includes("cp0_dst-jpg_s") || url.includes("_p") ) return "profile";
+  if (url.includes("cp0_dst-jpg_s") || url.includes("dst-jpg_s")) return "profile";
   if (url.includes("_n.jpg") || url.includes("_n.png")) return "post";
   return "other";
 }
 
+// ─── Deep extraction helpers ───────────────────────────────────────────────
+
+function first(html: string, ...patterns: RegExp[]): string | null {
+  for (const p of patterns) {
+    const m = html.match(p);
+    if (m?.[1]) return m[1].replace(/\\"/g, '"').replace(/\\u003C/g, "<").trim();
+  }
+  return null;
+}
+
+function all(html: string, pattern: RegExp): string[] {
+  return [...new Set([...html.matchAll(pattern)].map(m => m[1]).filter(Boolean))];
+}
+
+function deepParse(html: string, pageUrl?: string) {
+  const root = parse(html);
+
+  // ── Meta tags ──
+  const ogTitle    = root.querySelector('meta[property="og:title"]')?.getAttribute("content") ?? null;
+  const ogDesc     = root.querySelector('meta[property="og:description"]')?.getAttribute("content") ?? null;
+  const ogImage    = root.querySelector('meta[property="og:image"]')?.getAttribute("content") ?? null;
+  const ogUrl      = root.querySelector('meta[property="og:url"]')?.getAttribute("content") ?? null;
+  const ogType     = root.querySelector('meta[property="og:type"]')?.getAttribute("content") ?? null;
+  const metaDesc   = root.querySelector('meta[name="description"]')?.getAttribute("content") ?? null;
+  const canonical  = root.querySelector('link[rel="canonical"]')?.getAttribute("href") ?? null;
+  const title      = root.querySelector("title")?.text?.trim() ?? null;
+
+  // ── Identity ──
+  const uid = first(html,
+    /"userID"\s*:\s*"(\d+)"/,
+    /"USER_ID"\s*:\s*"(\d+)"/,
+    /"entity_id"\s*:\s*"(\d+)"/,
+    /"actorID"\s*:\s*"(\d+)"/,
+    /"ownerID"\s*:\s*"(\d+)"/,
+    /"profileID"\s*:\s*"(\d+)"/,
+    /"pageID"\s*:\s*"(\d+)"/,
+    /"id"\s*:\s*"(\d{8,})"/,
+    /content_owner_id_new":(\d+)/,
+    /"profile_id"\s*:\s*(\d+)/,
+  );
+
+  const username = first(html,
+    /"username"\s*:\s*"([^"]+)"/,
+    /"vanity"\s*:\s*"([^"]+)"/,
+    /"profile_url_params".*?"alias"\s*:\s*"([^"]+)"/s,
+  ) ?? (pageUrl ? pageUrl.split("facebook.com/")[1]?.split("?")[0]?.split("/")[0] : null);
+
+  // ── Profile info ──
+  const name = first(html,
+    /"__typename"\s*:\s*"User"[^}]{0,200}"name"\s*:\s*"([A-Za-zÀ-ÿ0-9 .'-]{2,80})"/s,
+    /"profile_name"\s*:\s*"([^"]{2,80})"/,
+    /"title"\s*:\s*"([A-Za-zÀ-ÿ0-9 .'-]{2,80})"\s*,\s*"__typename"\s*:\s*"User"/s,
+  ) ?? ogTitle;
+
+  const gender = first(html,
+    /"gender"\s*:\s*"([^"]+)"/,
+    /gender['"]\s*:\s*['"]([^'"]+)['"]/i,
+  );
+
+  const birthday = first(html,
+    /"birthday_reminder_info"[^}]*"date"\s*:\s*"([^"]+)"/s,
+    /"birth_date"\s*:\s*"([^"]+)"/,
+    /"birthdate"\s*:\s*\{[^}]*"text"\s*:\s*"([^"]+)"/s,
+  );
+
+  const createdTime = first(html,
+    /"creation_time"\s*:\s*(\d+)/,
+    /"account_created_time"\s*:\s*(\d+)/,
+    /"join_time"\s*:\s*(\d+)/,
+  );
+
+  const relationshipStatus = first(html,
+    /"relationship_status"\s*:\s*"([^"]+)"/,
+    /"relationship_status_for_story_sharing"\s*:\s*"([^"]+)"/,
+  );
+
+  // ── Location ──
+  const hometown = first(html,
+    /"hometown"\s*:\{[^}]*"name"\s*:\s*"([^"]+)"/s,
+    /"hometown_city"\s*:\{[^}]*"name"\s*:\s*"([^"]+)"/s,
+  );
+  const currentCity = first(html,
+    /"current_city"\s*:\{[^}]*"name"\s*:\s*"([^"]+)"/s,
+    /"current_address"\s*:\{[^}]*"city"\s*:\s*"([^"]+)"/s,
+  );
+
+  // ── Work & Education ──
+  const workMatches   = all(html, /"employer"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/gs);
+  const schoolMatches = all(html, /"school"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/gs);
+  const positionMatches = all(html, /"position"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"/gs);
+
+  // ── Stats ──
+  const followerCount = first(html,
+    /"follower_count"\s*:\s*(\d+)/,
+    /"followers_count"\s*:\s*(\d+)/,
+  );
+  const friendCount = first(html,
+    /"friend_count"\s*:\s*(\d+)/,
+    /"friends_count"\s*:\s*(\d+)/,
+    /"mutual_friends_count"\s*:\s*(\d+)/,
+  );
+
+  // ── Page / Group IDs ──
+  const pageGroupIds = all(html, /"(?:page_id|group_id|pageID)"\s*:\s*"(\d+)"/g);
+
+  // ── Email & Phone (sometimes exposed) ──
+  const emails  = all(html, /["'\s]([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})["'\s]/g)
+    .filter(e => !e.includes("facebook.com") && !e.includes("sentry.io") && !e.includes("example"));
+  const phones  = all(html, /["'](\+?[0-9][0-9\s\-().]{7,}[0-9])["']/g)
+    .filter(p => p.replace(/\D/g, "").length >= 9 && p.replace(/\D/g, "").length <= 15);
+
+  // ── Security tokens ──
+  const fbDtsg = first(html,
+    /"DTSGInitData"\s*,\s*\[\]\s*,\s*\{"token"\s*:\s*"([^"]+)"/,
+    /"fb_dtsg"\s*:\s*\{"value"\s*:\s*"([^"]+)"/,
+    /name="fb_dtsg"\s+value="([^"]+)"/,
+    /"fb_dtsg","([^"]+)"/,
+  );
+  const jazoest = first(html, /name="jazoest"\s+value="([^"]+)"/, /"jazoest"\s*:\s*"([^"]+)"/);
+  const lsd     = first(html, /"LSD"\s*,\s*\[\]\s*,\s*\{"token"\s*:\s*"([^"]+)"/, /"lsd"\s*:\s*"([^"]+)"/);
+  const spinT   = first(html, /"spin_t"\s*:\s*(\d+)/);
+  const spinR   = first(html, /"spin_r"\s*:\s*(\d+)/);
+
+  // ── Tracking & Ads ──
+  const fbPixelIds  = all(html, /fbq\s*\(\s*['"]init['"]\s*,\s*['"](\d+)['"]/g);
+  const adAccountId = first(html,
+    /"ad_account_id"\s*:\s*"([^"]+)"/,
+    /"adAccountID"\s*:\s*"([^"]+)"/,
+  );
+  const gaIds = all(html, /['"]?(UA-\d+-\d+|G-[A-Z0-9]+)['"]/g);
+
+  // ── API endpoints found in source ──
+  const apiEndpoints = all(html, /["'](\/api\/[a-zA-Z0-9_/\-.?=&]+)["']/g)
+    .filter(e => e.length < 120)
+    .slice(0, 20);
+
+  const graphqlEndpoints = all(html, /["'](https?:\/\/[a-z]+\.facebook\.com\/api\/[^"'\s]+)["']/g).slice(0, 10);
+
+  // ── Hidden JSON blobs from <script> tags ──
+  const scriptTags = root.querySelectorAll("script");
+  const jsonBlobs: Record<string, unknown>[] = [];
+  for (const s of scriptTags) {
+    const text = s.text;
+    if (!text || text.length < 50) continue;
+    // Try to find JSON-like objects with useful keys
+    if (/(userID|entity_id|actorID|follower_count|profile_id|dtsg|token)/.test(text)) {
+      const snippets = text.match(/\{[^{}]{30,500}\}/g) ?? [];
+      for (const snippet of snippets.slice(0, 5)) {
+        try {
+          const parsed = JSON.parse(snippet) as Record<string, unknown>;
+          if (Object.keys(parsed).length > 1) jsonBlobs.push(parsed);
+        } catch { /* skip non-JSON */ }
+      }
+    }
+  }
+
+  // ── Images ──
+  const imageUrls = extractFbcdnUrls(html);
+  const images = imageUrls.map(u => ({ url: u, type: classifyUrl(u) }));
+  if (ogImage && !images.find(i => i.url === ogImage)) {
+    images.unshift({ url: ogImage, type: "profile" as const });
+  }
+
+  return {
+    // ── Identity
+    identity: {
+      uid:      uid ?? null,
+      username: username ?? null,
+      name:     name ?? null,
+      page_url: ogUrl ?? canonical ?? pageUrl ?? null,
+      og_type:  ogType ?? null,
+    },
+    // ── Profile
+    profile: {
+      gender:              gender ?? null,
+      birthday:            birthday ?? null,
+      account_created_at:  createdTime ? new Date(Number(createdTime) * 1000).toISOString() : null,
+      account_created_ts:  createdTime ? Number(createdTime) : null,
+      relationship_status: relationshipStatus ?? null,
+      hometown:            hometown ?? null,
+      current_city:        currentCity ?? null,
+      follower_count:      followerCount ? Number(followerCount) : null,
+      friend_count:        friendCount   ? Number(friendCount)   : null,
+      bio:                 ogDesc ?? metaDesc ?? null,
+    },
+    // ── Work & Education
+    work_education: {
+      employers: workMatches,
+      positions: positionMatches,
+      schools:   schoolMatches,
+    },
+    // ── IDs
+    ids: {
+      page_group_ids: pageGroupIds,
+    },
+    // ── Contact (if exposed)
+    contact: {
+      emails:        emails.slice(0, 5),
+      phone_numbers: phones.slice(0, 5),
+    },
+    // ── Security tokens
+    tokens: {
+      fb_dtsg:  fbDtsg  ?? null,
+      jazoest:  jazoest ?? null,
+      lsd:      lsd     ?? null,
+      spin_t:   spinT   ? Number(spinT) : null,
+      spin_r:   spinR   ? Number(spinR) : null,
+    },
+    // ── Tracking
+    tracking: {
+      facebook_pixel_ids: fbPixelIds,
+      ad_account_id:      adAccountId ?? null,
+      google_analytics:   gaIds,
+    },
+    // ── API surface
+    api_endpoints: {
+      internal:  apiEndpoints,
+      graphql:   graphqlEndpoints,
+    },
+    // ── Media
+    images: {
+      total:  images.length,
+      avatar: ogImage ?? null,
+      list:   images,
+    },
+    // ── Raw JSON snippets found in page
+    json_snippets: jsonBlobs.slice(0, 10),
+  };
+}
+
+// ─── Routes ───────────────────────────────────────────────────────────────
+
+// Existing: scrape images only (kept for backward compat)
 router.get("/facebook/scrape", async (req: Request, res: Response) => {
   const { url } = req.query as { url?: string };
-
-  if (!url) {
-    res.status(400).json({
-      error: "Missing required query param: url",
-      example: "/api/facebook/scrape?url=https://www.facebook.com/username",
-    });
-    return;
-  }
-
-  // Validate it's a Facebook URL
-  if (!url.includes("facebook.com")) {
-    res.status(400).json({ error: "URL must be a facebook.com address" });
-    return;
-  }
-
+  if (!url) { res.status(400).json({ error: "Missing ?url=", example: "/api/facebook/scrape?url=https://www.facebook.com/username" }); return; }
+  if (!url.includes("facebook.com")) { res.status(400).json({ error: "URL must be facebook.com" }); return; }
   try {
-    const response = await fetch(url, {
-      headers: BROWSER_HEADERS,
-      redirect: "follow",
-    });
-
-    if (!response.ok) {
-      res.status(502).json({
-        error: `Facebook returned HTTP ${response.status}`,
-        hint: "The page may require login or the URL is invalid",
-      });
-      return;
-    }
-
+    const response = await fetch(url, { headers: BROWSER_HEADERS, redirect: "follow" });
+    if (!response.ok) { res.status(502).json({ error: `Facebook HTTP ${response.status}` }); return; }
     const html = await response.text();
-    const allUrls = extractFbcdnUrls(html);
-
-    // Classify and group images
-    const images = allUrls.map((imageUrl) => ({
-      url: imageUrl,
-      type: classifyUrl(imageUrl),
-    }));
-
-    // Also try to extract basic page info
+    const images = extractFbcdnUrls(html).map(u => ({ url: u, type: classifyUrl(u) }));
     const root = parse(html);
-    const title = root.querySelector("title")?.text?.trim() ?? null;
     const ogImage = root.querySelector('meta[property="og:image"]')?.getAttribute("content") ?? null;
     const ogTitle = root.querySelector('meta[property="og:title"]')?.getAttribute("content") ?? null;
-
-    if (ogImage && !images.find((i) => i.url === ogImage)) {
-      images.unshift({ url: ogImage, type: "profile" });
-    }
-
-    res.json({
-      page_url: url,
-      page_title: ogTitle ?? title,
-      total: images.length,
-      note:
-        images.length === 0
-          ? "Không tìm thấy ảnh. Facebook có thể yêu cầu đăng nhập để xem trang này."
-          : null,
-      images,
-    });
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
+    if (ogImage && !images.find(i => i.url === ogImage)) images.unshift({ url: ogImage, type: "profile" });
+    res.json({ page_url: url, page_title: ogTitle, total: images.length, images });
+  } catch (err) { res.status(500).json({ error: (err as Error).message }); }
 });
 
-router.post("/facebook/scrape/html", async (req: Request, res: Response) => {
-  const { html } = req.body as { html?: string };
+// NEW: full deep extract via URL
+router.get("/facebook/deep", async (req: Request, res: Response) => {
+  const { url } = req.query as { url?: string };
+  if (!url) { res.status(400).json({ error: "Missing ?url=", example: "/api/facebook/deep?url=https://www.facebook.com/username" }); return; }
+  if (!url.includes("facebook.com")) { res.status(400).json({ error: "URL must be facebook.com" }); return; }
+  try {
+    const response = await fetch(url, { headers: BROWSER_HEADERS, redirect: "follow" });
+    if (!response.ok) { res.status(502).json({ error: `Facebook HTTP ${response.status}`, hint: "Page may require login" }); return; }
+    const html = await response.text();
+    res.json(deepParse(html, url));
+  } catch (err) { res.status(500).json({ error: (err as Error).message }); }
+});
 
+// NEW: full deep extract via pasted HTML
+router.post("/facebook/deep/html", async (req: Request, res: Response) => {
+  const { html, url } = req.body as { html?: string; url?: string };
   if (!html || typeof html !== "string") {
-    res.status(400).json({
-      error: "Missing 'html' field in request body",
-      usage: "POST /api/facebook/scrape/html with body: { \"html\": \"<paste view-source here>\" }",
-    });
+    res.status(400).json({ error: "Missing 'html' in body", usage: "POST body: { \"html\": \"<view-source paste>\", \"url\": \"optional original url\" }" });
     return;
   }
+  res.json(deepParse(html, url));
+});
 
-  const allUrls = extractFbcdnUrls(html);
-
-  const images = allUrls.map((imageUrl) => ({
-    url: imageUrl,
-    type: classifyUrl(imageUrl),
-  }));
-
+// Existing: scrape images from pasted HTML
+router.post("/facebook/scrape/html", async (req: Request, res: Response) => {
+  const { html } = req.body as { html?: string };
+  if (!html || typeof html !== "string") { res.status(400).json({ error: "Missing 'html' in body" }); return; }
+  const images = extractFbcdnUrls(html).map(u => ({ url: u, type: classifyUrl(u) }));
   const root = parse(html);
   const ogImage = root.querySelector('meta[property="og:image"]')?.getAttribute("content") ?? null;
   const ogTitle = root.querySelector('meta[property="og:title"]')?.getAttribute("content") ?? null;
-
-  if (ogImage && !images.find((i) => i.url === ogImage)) {
-    images.unshift({ url: ogImage, type: "profile" });
-  }
-
-  res.json({
-    page_title: ogTitle ?? null,
-    total: images.length,
-    images,
-  });
+  if (ogImage && !images.find(i => i.url === ogImage)) images.unshift({ url: ogImage, type: "profile" });
+  res.json({ page_title: ogTitle, total: images.length, images });
 });
 
 export default router;

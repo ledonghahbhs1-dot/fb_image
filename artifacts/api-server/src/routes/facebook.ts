@@ -77,7 +77,16 @@ interface RelayUser {
 // ─── helpers shared between relay & deepParse ──────────────────────────────
 
 function fbUnescape(s: string): string {
-  return s.replace(/\\\//g, "/").replace(/\\u003C/g, "<").replace(/\\u003E/g, ">").replace(/\\u0026/g, "&").replace(/\\"/g, '"');
+  return s
+    // data-sjs blocks double-encode: \\uXXXX → actual char (handle first)
+    .replace(/\\\\u([0-9a-fA-F]{4})/g, (_, c) => String.fromCharCode(parseInt(c, 16)))
+    // standard JSON \uXXXX escapes
+    .replace(/\\u([0-9a-fA-F]{4})/g,   (_, c) => String.fromCharCode(parseInt(c, 16)))
+    .replace(/\\\//g, "/")
+    .replace(/\\\\n/g, "\n")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .replace(/\\"/g, '"');
 }
 
 /** Extract birthday from all known FB formats found anywhere in a text chunk */
@@ -270,23 +279,66 @@ function deepParse(html: string, pageUrl?: string) {
     /"profile_id"\s*:\s*(\d+)/,
   );
 
-  const username = first(html,
-    /"username"\s*:\s*"([^"]+)"/,
-    /"vanity"\s*:\s*"([^"]+)"/,
-    /"profile_url_params".*?"alias"\s*:\s*"([^"]+)"/s,
-  ) ?? (pageUrl ? pageUrl.split("facebook.com/")[1]?.split("?")[0]?.split("/")[0] : null);
+  // Derive username from the profile URL (most reliable — avoids picking up viewer's own username)
+  // profile_user section contains "url":"https://www.facebook.com/SLUG" for the viewed user
+  const profileSlugFromUrl = (() => {
+    const rawUrl = html.match(/"profile_user"\s*:\s*\{[^}]{0,500}"url"\s*:\s*"(https:\/\/(?:www\.)?facebook\.com\/([^"/?\\]+))"/s)?.[2]
+                ?? html.match(/"header_top_row"[\s\S]{0,1000}"url"\s*:\s*"https:\/\/(?:www\.)?facebook\.com\/([^"/?\\]+)"/s)?.[1]
+                ?? null;
+    // Exclude numeric IDs (those are not vanity slugs)
+    return rawUrl && !/^\d+$/.test(rawUrl) ? rawUrl : null;
+  })();
+
+  const username = profileSlugFromUrl
+    ?? first(html,
+      /"vanity"\s*:\s*"([^"]{2,60})"/,
+      /"profile_url_params".*?"alias"\s*:\s*"([^"]+)"/s,
+    )
+    ?? (pageUrl ? pageUrl.split("facebook.com/")[1]?.split("?")[0]?.split("/")[0] : null)
+    ?? first(html, /"username"\s*:\s*"([^"]{2,60})"/);  // last resort (may be viewer's own)
+
+  // ── profile_user section — most reliable for the VIEWED profile (not viewer) ──
+  // "profile_user":{"__isProfile":"User","name":"..."} or header_top_row variant
+  const profileUserM = html.match(/"profile_user"\s*:\s*\{"__isProfile"\s*:\s*"User"\s*,\s*"name"\s*:\s*"([^"]+)"([\s\S]{0,8000})/s)
+                    ?? html.match(/"profile_user"\s*:\s*\{"__isProfile[^}]{0,100}"name"\s*:\s*"([^"]+)"([\s\S]{0,8000})/s);
+  const profileUserChunk = profileUserM ? (profileUserM[0]) : "";
+
+  // ── __isProfile section (fallback) ──
+  const isProfileIdx = html.indexOf('"__isProfile":"User"');
+  const isProfileChunk = isProfileIdx >= 0
+    ? html.slice(Math.max(0, isProfileIdx - 50), Math.min(html.length, isProfileIdx + 8000))
+    : "";
+
+  // Use profile_user chunk first, then __isProfile as fallback
+  const mainChunk = profileUserChunk || isProfileChunk;
 
   // ── Profile info ──
-  const name = first(html,
-    /"__typename"\s*:\s*"User"[^}]{0,200}"name"\s*:\s*"([A-Za-zÀ-ÿ0-9 .'-]{2,80})"/s,
-    /"profile_name"\s*:\s*"([^"]{2,80})"/,
-    /"title"\s*:\s*"([A-Za-zÀ-ÿ0-9 .'-]{2,80})"\s*,\s*"__typename"\s*:\s*"User"/s,
-  ) ?? ogTitle;
+  const name = (mainChunk
+    ? (mainChunk.match(/"name"\s*:\s*"([^"]{2,120})"/)?.[1] ?? null)
+    : null)
+    ?? first(html,
+      /"profile_name"\s*:\s*"([^"]{2,80})"/,
+    ) ?? ogTitle;
 
-  const gender = first(html,
-    /"gender"\s*:\s*"([^"]+)"/,
-    /gender['"]\s*:\s*['"]([^'"]+)['"]/i,
-  );
+  // gender often lives in __isProfile chunk (not always in profile_user chunk)
+  const gender = first(mainChunk, /"gender"\s*:\s*"([A-Z]+)"/)
+              ?? first(isProfileChunk, /"gender"\s*:\s*"([A-Z]+)"/)
+              ?? first(html, /"gender"\s*:\s*"(MALE|FEMALE|OTHER)"/);
+
+  // Profile picture from profile section
+  const profilePicFromSection = mainChunk
+    ? fbUnescape(mainChunk.match(/"profilePicLarge"\s*:\s*\{"uri"\s*:\s*"([^"]+)"/)?.[1] ?? "")
+    : null;
+
+  // is_viewer_friend (only meaningful on logged-in HTML)
+  const isViewerFriend = mainChunk
+    ? (mainChunk.match(/"is_viewer_friend"\s*:\s*(true|false)/)?.[1] === "true" ? true : false)
+    : null;
+
+  // Profile URL from profile section
+  const profileUrlFromSection = mainChunk
+    ? fbUnescape(mainChunk.match(/"url"\s*:\s*"(https:\/\/(?:www\.)?facebook\.com\/[^"]+)"/)?.[1] ?? "")
+    : null;
 
   const birthdayInfo = parseBirthday(html);
 
@@ -311,6 +363,44 @@ function deepParse(html: string, pageUrl?: string) {
     /"current_location"\s*:\s*\{[^}]{0,300}"name"\s*:\s*"([^"]+)"/s,
     /"current_address"\s*:\s*\{[^}]{0,300}"city"\s*:\s*"([^"]+)"/s,
   );
+
+  // ── Tile section texts (e.g. "Sống ở Hà Nội", "Quê ở ...", "Học tại ...") ──
+  // Facebook renders these as display strings inside profile_feature sections
+  const tileTexts: string[] = [];
+  const tileRe = /"profile_feature"\s*:\s*"(?:PERSONAL_DETAILS|HOMETOWN|CURRENT_CITY|WORK|EDUCATION)"[\s\S]{0,3000}/gs;
+  for (const sec of html.matchAll(tileRe)) {
+    for (const tm of sec[0].matchAll(/"text"\s*:\s*"([^"]{2,200})"/g)) {
+      const t = fbUnescape(tm[1]);
+      if (!tileTexts.includes(t) && !/^[{[]/.test(t)) tileTexts.push(t);
+    }
+  }
+
+  // ── Education institutions from Relay User blocks (school pages embedded in edu section) ──
+  // Facebook embeds school page data as Relay nodes BEFORE the education_type field.
+  // Strategy: for each education_type occurrence, scan 3000 chars BEFORE it for school data.
+  const eduInstitutions: { id: string; name: string; url: string; type: string | null }[] = [];
+  const eduTypeRe = /"education_type"\s*:\s*"([^"]+)"/g;
+  const seenEduIds = new Set<string>();
+  for (const eduTypeM of html.matchAll(eduTypeRe)) {
+    const eduType    = eduTypeM[1];
+    const pos        = eduTypeM.index!;
+    // Scan window: 3000 chars before + 1000 chars after education_type
+    const window     = html.slice(Math.max(0, pos - 3000), Math.min(html.length, pos + 1000));
+    const shortName  = window.match(/"short_name"\s*:\s*"([^"]{2,200})"/)?.[1] ?? null;
+    const instUrl    = window.match(/"url"\s*:\s*"(https:\/\/[^"]*facebook\.com\/[^"]+)"/)?.[1] ?? null;
+    const instId     = window.match(/"id"\s*:\s*"(\d{5,20})"/)?.[1] ?? null;
+    const nameMatch  = window.match(/"name"\s*:\s*"([^"]{2,200})"/)?.[1] ?? null;
+    const bestName   = shortName ?? nameMatch ?? null;
+    if (bestName && instId && !seenEduIds.has(instId)) {
+      seenEduIds.add(instId);
+      eduInstitutions.push({
+        id:   instId,
+        name: fbUnescape(bestName),
+        url:  instUrl ? fbUnescape(instUrl) : "",
+        type: eduType,
+      });
+    }
+  }
 
   // ── Work & Education (structured) ──
   const workEntries = parseWork(html);
@@ -394,11 +484,12 @@ function deepParse(html: string, pageUrl?: string) {
   return {
     // ── Identity
     identity: {
-      uid:      uid ?? null,
-      username: username ?? null,
-      name:     name ?? null,
-      page_url: ogUrl ?? canonical ?? pageUrl ?? null,
-      og_type:  ogType ?? null,
+      uid:              uid ?? null,
+      username:         username ?? null,
+      name:             name ? fbUnescape(name) : null,
+      page_url:         profileUrlFromSection || ogUrl || canonical || pageUrl || null,
+      og_type:          ogType ?? null,
+      is_viewer_friend: isViewerFriend,
     },
     // ── Profile
     profile: {
@@ -412,11 +503,15 @@ function deepParse(html: string, pageUrl?: string) {
       follower_count:      followerCount ? Number(followerCount) : null,
       friend_count:        friendCount   ? Number(friendCount)   : null,
       bio:                 ogDesc ?? metaDesc ?? null,
+      profile_picture:     profilePicFromSection || ogImage || null,
+      // Human-readable display texts Facebook shows on the About tab
+      display_info:        tileTexts.filter(t => t.length > 2 && !/^[\d.]+$/.test(t)).slice(0, 20),
     },
     // ── Work & Education
     work_education: {
-      work:      workEntries,
-      education: eduEntries,
+      work:                workEntries,
+      education:           eduEntries,
+      education_institutions: eduInstitutions,
     },
     // ── IDs
     ids: {
